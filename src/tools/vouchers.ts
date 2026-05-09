@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { lexwareRequest, lexwareUpload } from '../services/lexware.js';
 import { handleToolRequest, withProcessingRetry } from '../helpers.js';
 import { UuidSchema } from '../schemas/common.js';
+import { MAX_UPLOAD_BYTES } from '../constants.js';
 import { normalizeVoucherStatus } from '../helpers/normalize-voucher-status.js';
 
 const EXT_CONTENT_TYPES: Record<string, string> = {
@@ -201,9 +202,9 @@ export function registerVoucherTools(server: McpServer): void {
   server.registerTool('lexware_upload_voucher_file', {
     title: 'Upload Voucher File',
     description:
-      'Upload a file attachment to a bookkeeping voucher. Provide either filePath (absolute path on the MCP ' +
-      'server host) or contentBase64 (base64-encoded content) — not both. When using filePath, fileName is ' +
-      'optional (derived from the file name) and contentType is auto-detected for common image extensions. ' +
+      'Upload a file attachment to a bookkeeping voucher. Maximum file size: 5 MB (returns file_too_large error immediately if exceeded). ' +
+      'Provide either filePath (absolute path on the MCP server host) or contentBase64 (base64-encoded content) — not both. ' +
+      'When using filePath, fileName is optional (derived from the file name) and contentType is auto-detected for common image extensions. ' +
       'When using contentBase64, fileName is required.',
     inputSchema: z
       .object({
@@ -268,6 +269,15 @@ export function registerVoucherTools(server: McpServer): void {
       buffer = Buffer.from(params.contentBase64!, 'base64');
       resolvedFileName = params.fileName!;
       resolvedContentType = params.contentType ?? 'application/pdf';
+    }
+
+    if (buffer.byteLength > MAX_UPLOAD_BYTES) {
+      throw new Error(JSON.stringify({
+        error: 'file_too_large',
+        actualSize: buffer.byteLength,
+        maxSize: MAX_UPLOAD_BYTES,
+        suggestion: 'Compress the PDF or re-scan at lower DPI to reduce file size below 5 MB',
+      }));
     }
 
     return lexwareUpload(`/vouchers/${params.id}/files`, buffer, resolvedFileName, resolvedContentType);
