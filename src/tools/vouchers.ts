@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { lexwareRequest, lexwareUpload } from '../services/lexware.js';
 import { handleToolRequest } from '../helpers.js';
 import { UuidSchema, PaginationParams } from '../schemas/common.js';
+import { normalizeVoucherStatus } from '../helpers/normalize-voucher-status.js';
 
 const EXT_CONTENT_TYPES: Record<string, string> = {
   '.png': 'image/png',
@@ -35,7 +36,11 @@ export function registerVoucherTools(server: McpServer): void {
 
   server.registerTool('lexware_get_voucher', {
     title: 'Get Voucher',
-    description: 'Retrieve a bookkeeping voucher by ID from Lexware.',
+    description:
+      'Retrieve a bookkeeping voucher by ID from Lexware. ' +
+      'The voucherStatus field in the response is normalised to its canonical lowercase form. ' +
+      'Known values: unchecked (pending review), open (due for payment), paid, ' +
+      'paidoff (settled), voided (cancelled), transferred (posted), sepadebit (SEPA direct debit).',
     inputSchema: z.object({
       id: UuidSchema.describe('Voucher UUID'),
     }),
@@ -46,7 +51,15 @@ export function registerVoucherTools(server: McpServer): void {
       openWorldHint: true,
     },
   }, handleToolRequest(async (params) => {
-    return lexwareRequest('GET', `/vouchers/${params.id}`);
+    const voucher = await lexwareRequest<Record<string, unknown>>('GET', `/vouchers/${params.id}`);
+    // GET /vouchers/{id} may return the status as 'status' while GET /vouchers
+    // uses 'voucherStatus'. Normalise to 'voucherStatus' (canonical field name).
+    const rawStatus = voucher.voucherStatus ?? voucher.status;
+    if (typeof rawStatus === 'string') {
+      voucher.voucherStatus = normalizeVoucherStatus(rawStatus);
+      delete voucher.status;
+    }
+    return voucher;
   }));
 
   server.registerTool('lexware_update_voucher', {
@@ -68,11 +81,18 @@ export function registerVoucherTools(server: McpServer): void {
 
   server.registerTool('lexware_list_vouchers', {
     title: 'List Vouchers',
-    description: 'List bookkeeping vouchers from Lexware with optional filters.',
+    description:
+      'List bookkeeping vouchers from Lexware with optional filters. ' +
+      'voucherStatus filter values (case-insensitive): unchecked (pending review), ' +
+      'open (due for payment), paid, paidoff (settled), voided (cancelled), ' +
+      'transferred (posted), sepadebit (SEPA direct debit). ' +
+      'The value is normalised to lowercase before the API call.',
     inputSchema: z.object({
       ...PaginationParams,
       voucherNumber: z.string().optional().describe('Filter by voucher number'),
-      voucherStatus: z.string().optional().describe('Filter by voucher status'),
+      voucherStatus: z.string().optional().describe(
+        'Filter by voucher status. Accepted values: unchecked, open, paid, paidoff, voided, transferred, sepadebit. Case-insensitive.'
+      ),
     }),
     annotations: {
       readOnlyHint: true,
@@ -85,7 +105,7 @@ export function registerVoucherTools(server: McpServer): void {
       page: params.page,
       size: params.size,
       voucherNumber: params.voucherNumber,
-      voucherStatus: params.voucherStatus,
+      voucherStatus: params.voucherStatus ? normalizeVoucherStatus(params.voucherStatus) : undefined,
     });
   }));
 
