@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { normalizeVoucherStatus } from '../helpers/normalize-voucher-status.js';
 import { createServer } from '../server.js';
 import { registerVoucherTools } from '../tools/vouchers.js';
@@ -180,5 +180,62 @@ describe('lexware_list_vouchers', () => {
       'GET', '/vouchers', undefined,
       { page: 2, size: 50, voucherNumber: 'RE-001', voucherStatus: 'open' },
     );
+  });
+});
+
+// ─── lexware_get_voucher — retry behavior ─────────────────────────────────────
+
+describe('lexware_get_voucher — retry behavior', () => {
+  let handler: (params: unknown) => Promise<any>;
+
+  beforeEach(() => {
+    mocks.lexwareRequest.mockReset();
+    vi.useFakeTimers();
+    handler = captureTools(registerVoucherTools).get('lexware_get_voucher')!.handler;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('returns processing response after exhausting 3 retries on 404', async () => {
+    const err404 = Object.assign(new Error('Not Found'), { cause: { response: { status: 404 } } });
+    mocks.lexwareRequest.mockRejectedValue(err404);
+
+    const promise = handler({ id: VALID_UUID });
+    await vi.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent.status).toBe('processing');
+    expect(result.structuredContent.voucherId).toBe(VALID_UUID);
+    expect(result.structuredContent.message).toContain('retry');
+    expect(mocks.lexwareRequest).toHaveBeenCalledTimes(3);
+  });
+
+  it('returns the voucher on the second attempt after an initial 404', async () => {
+    const err404 = Object.assign(new Error('Not Found'), { cause: { response: { status: 404 } } });
+    mocks.lexwareRequest
+      .mockRejectedValueOnce(err404)
+      .mockResolvedValue({ id: VALID_UUID, voucherStatus: 'open', version: 1 });
+
+    const promise = handler({ id: VALID_UUID });
+    await vi.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent.voucherStatus).toBe('open');
+    expect(mocks.lexwareRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns processing response for non-404 errors without retrying', async () => {
+    mocks.lexwareRequest.mockRejectedValue(new Error('Internal Server Error'));
+
+    const result = await handler({ id: VALID_UUID });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent.status).toBe('processing');
+    expect(result.structuredContent.voucherId).toBe(VALID_UUID);
+    expect(mocks.lexwareRequest).toHaveBeenCalledTimes(1);
   });
 });

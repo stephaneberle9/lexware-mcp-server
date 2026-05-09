@@ -3,7 +3,7 @@ import { z } from 'zod';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { lexwareRequest, lexwareUpload } from '../services/lexware.js';
-import { handleToolRequest } from '../helpers.js';
+import { handleToolRequest, withProcessingRetry } from '../helpers.js';
 import { UuidSchema, PaginationParams } from '../schemas/common.js';
 import { normalizeVoucherStatus } from '../helpers/normalize-voucher-status.js';
 
@@ -40,7 +40,9 @@ export function registerVoucherTools(server: McpServer): void {
       'Retrieve a bookkeeping voucher by ID from Lexware. ' +
       'The voucherStatus field in the response is normalised to its canonical lowercase form. ' +
       'Known values: unchecked (pending review), open (due for payment), paid, ' +
-      'paidoff (settled), voided (cancelled), transferred (posted), sepadebit (SEPA direct debit).',
+      'paidoff (settled), voided (cancelled), transferred (posted), sepadebit (SEPA direct debit). ' +
+      'Retries up to 3 times (1 s / 2 s / 4 s) on 404 to handle post-upload race conditions. ' +
+      'After exhausted retries returns { voucherId, status: "processing", message } instead of an error.',
     inputSchema: z.object({
       id: UuidSchema.describe('Voucher UUID'),
     }),
@@ -51,15 +53,25 @@ export function registerVoucherTools(server: McpServer): void {
       openWorldHint: true,
     },
   }, handleToolRequest(async (params) => {
-    const voucher = await lexwareRequest<Record<string, unknown>>('GET', `/vouchers/${params.id}`);
-    // GET /vouchers/{id} may return the status as 'status' while GET /vouchers
-    // uses 'voucherStatus'. Normalise to 'voucherStatus' (canonical field name).
-    const rawStatus = voucher.voucherStatus ?? voucher.status;
-    if (typeof rawStatus === 'string') {
-      voucher.voucherStatus = normalizeVoucherStatus(rawStatus);
-      delete voucher.status;
+    try {
+      return await withProcessingRetry(async () => {
+        const voucher = await lexwareRequest<Record<string, unknown>>('GET', `/vouchers/${params.id}`);
+        // GET /vouchers/{id} may return the status as 'status' while GET /vouchers
+        // uses 'voucherStatus'. Normalise to 'voucherStatus' (canonical field name).
+        const rawStatus = voucher.voucherStatus ?? voucher.status;
+        if (typeof rawStatus === 'string') {
+          voucher.voucherStatus = normalizeVoucherStatus(rawStatus);
+          delete voucher.status;
+        }
+        return voucher;
+      });
+    } catch {
+      return {
+        voucherId: params.id as string,
+        status: 'processing',
+        message: 'Voucher is still being processed by Lexware — please retry in 30 seconds.',
+      };
     }
-    return voucher;
   }));
 
   server.registerTool('lexware_update_voucher', {
