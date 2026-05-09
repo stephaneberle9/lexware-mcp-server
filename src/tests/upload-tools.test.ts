@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   accessSync: vi.fn(),
   readFileSync: vi.fn(),
   lexwareUpload: vi.fn(),
+  lexwareRequest: vi.fn(),
 }));
 
 vi.mock('node:fs', () => ({
@@ -21,7 +22,7 @@ vi.mock('node:fs', () => ({
 }));
 
 vi.mock('../services/lexware.js', () => ({
-  lexwareRequest: vi.fn(),
+  lexwareRequest: mocks.lexwareRequest,
   lexwareUpload: mocks.lexwareUpload,
   lexwareDownload: vi.fn(),
 }));
@@ -55,7 +56,10 @@ describe('lexware_upload_file', () => {
     mocks.accessSync.mockReset();
     mocks.readFileSync.mockReset();
     mocks.lexwareUpload.mockReset();
+    mocks.lexwareRequest.mockReset();
     mocks.lexwareUpload.mockResolvedValue({ id: 'file-123' });
+    // Default enrichment response so non-enrichment tests don't land in the catch branch.
+    mocks.lexwareRequest.mockResolvedValue({ id: 'file-123', createdDate: new Date().toISOString(), voucherStatus: 'unchecked' });
 
     const tools = captureTools(registerFileTools);
     ({ schema, handler } = tools.get('lexware_upload_file')!);
@@ -164,13 +168,79 @@ describe('lexware_upload_file', () => {
       expect(mocks.lexwareUpload).toHaveBeenCalledWith('/files', expect.any(Buffer), 'receipt.png', 'application/pdf');
     });
 
-    it('returns upload result on success', async () => {
+    it('returns no error on success', async () => {
       mocks.realpathSync.mockReturnValue('/docs/invoice.pdf');
       mocks.readFileSync.mockReturnValue(Buffer.from('content'));
-      mocks.lexwareUpload.mockResolvedValue({ id: 'abc-123' });
       const result = await handler({ filePath: '/docs/invoice.pdf' }) as any;
       expect(result.isError).toBeUndefined();
-      expect(result.structuredContent).toEqual({ id: 'abc-123' });
+    });
+  });
+
+  describe('handler — post-upload enrichment', () => {
+    beforeEach(() => {
+      mocks.realpathSync.mockReturnValue('/docs/invoice.pdf');
+      mocks.readFileSync.mockReturnValue(Buffer.from('content'));
+      mocks.lexwareUpload.mockResolvedValue({ id: 'file-abc' });
+    });
+
+    it('fetches file status using id from upload response', async () => {
+      mocks.lexwareRequest.mockResolvedValue({ id: 'file-abc', createdDate: new Date().toISOString() });
+      await handler({ filePath: '/docs/invoice.pdf' });
+      expect(mocks.lexwareRequest).toHaveBeenCalledWith('GET', '/files/file-abc');
+    });
+
+    it('falls back to documentFileId when id is absent', async () => {
+      mocks.lexwareUpload.mockResolvedValue({ documentFileId: 'doc-xyz' });
+      mocks.lexwareRequest.mockResolvedValue({ documentFileId: 'doc-xyz', createdDate: new Date().toISOString() });
+      const sc = (await handler({ filePath: '/docs/invoice.pdf' }) as any).structuredContent;
+      expect(sc.fileId).toBe('doc-xyz');
+      expect(mocks.lexwareRequest).toHaveBeenCalledWith('GET', '/files/doc-xyz');
+    });
+
+    it('sets created: true when createdDate is within 60 seconds', async () => {
+      mocks.lexwareRequest.mockResolvedValue({ id: 'file-abc', createdDate: new Date().toISOString() });
+      const sc = (await handler({ filePath: '/docs/invoice.pdf' }) as any).structuredContent;
+      expect(sc.created).toBe(true);
+    });
+
+    it('sets created: false when createdDate is older than 60 seconds', async () => {
+      const oldDate = new Date(Date.now() - 120_000).toISOString();
+      mocks.lexwareRequest.mockResolvedValue({ id: 'file-abc', createdDate: oldDate });
+      const sc = (await handler({ filePath: '/docs/invoice.pdf' }) as any).structuredContent;
+      expect(sc.created).toBe(false);
+    });
+
+    it('sets created: null when createdDate is missing from file info', async () => {
+      mocks.lexwareRequest.mockResolvedValue({ id: 'file-abc' });
+      const sc = (await handler({ filePath: '/docs/invoice.pdf' }) as any).structuredContent;
+      expect(sc.created).toBeNull();
+    });
+
+    it('sets created: null and voucherStatus: "processing" when GET fails', async () => {
+      mocks.lexwareRequest.mockRejectedValue(new Error('Lexware unavailable'));
+      const sc = (await handler({ filePath: '/docs/invoice.pdf' }) as any).structuredContent;
+      expect(sc.created).toBeNull();
+      expect(sc.voucherStatus).toBe('processing');
+      expect(sc.fileId).toBe('file-abc');
+      expect(sc.isError).toBeUndefined();
+    });
+
+    it('skips enrichment and returns raw result when no fileId is extractable', async () => {
+      mocks.lexwareUpload.mockResolvedValue({ resourceUri: '/files/something' });
+      const sc = (await handler({ filePath: '/docs/invoice.pdf' }) as any).structuredContent;
+      expect(sc.fileId).toBeUndefined();
+      expect(mocks.lexwareRequest).not.toHaveBeenCalled();
+    });
+
+    it('merges upload and file info fields in the response', async () => {
+      const createdDate = new Date().toISOString();
+      mocks.lexwareUpload.mockResolvedValue({ id: 'file-abc', originalFileName: 'invoice.pdf' });
+      mocks.lexwareRequest.mockResolvedValue({ id: 'file-abc', createdDate, voucherStatus: 'unchecked', size: 12345 });
+      const sc = (await handler({ filePath: '/docs/invoice.pdf' }) as any).structuredContent;
+      expect(sc.originalFileName).toBe('invoice.pdf');
+      expect(sc.size).toBe(12345);
+      expect(sc.createdDate).toBe(createdDate);
+      expect(sc.fileId).toBe('file-abc');
     });
   });
 
@@ -212,6 +282,7 @@ describe('lexware_upload_voucher_file', () => {
     mocks.accessSync.mockReset();
     mocks.readFileSync.mockReset();
     mocks.lexwareUpload.mockReset();
+    mocks.lexwareRequest.mockReset();
     mocks.lexwareUpload.mockResolvedValue({ id: 'vf-456' });
 
     const tools = captureTools(registerVoucherTools);

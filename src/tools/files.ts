@@ -21,7 +21,11 @@ export function registerFileTools(server: McpServer): void {
       'Upload a file to Lexware. Provide either filePath (absolute path on the MCP server host) or ' +
       'contentBase64 (base64-encoded content) — not both. When using filePath, fileName is optional ' +
       '(derived from the file name) and contentType is auto-detected for common image extensions. ' +
-      'When using contentBase64, fileName is required.',
+      'When using contentBase64, fileName is required. ' +
+      'The response is enriched with file metadata fetched after upload: ' +
+      'created (true = freshly created ≤60 s ago; false = pre-existing file — use as duplicate-detection signal; ' +
+      'null = Lexware is still processing, status unavailable), ' +
+      'voucherStatus, and createdDate (ISO 8601).',
     inputSchema: z
       .object({
         filePath: z
@@ -86,7 +90,27 @@ export function registerFileTools(server: McpServer): void {
       resolvedContentType = params.contentType ?? 'application/pdf';
     }
 
-    return lexwareUpload('/files', buffer, resolvedFileName, resolvedContentType);
+    const uploadResult = await lexwareUpload<Record<string, unknown>>('/files', buffer, resolvedFileName, resolvedContentType);
+
+    // Extract the file ID — the API may use 'id' (UUID) or 'documentFileId'.
+    const fileId = (uploadResult.id ?? uploadResult.documentFileId) as string | undefined;
+    if (!fileId) {
+      return uploadResult;
+    }
+
+    try {
+      const fileInfo = await lexwareRequest<Record<string, unknown>>('GET', `/files/${fileId}`);
+      const createdDate = (fileInfo.createdDate ?? uploadResult.createdDate) as string | undefined;
+      // created: true  → file is ≤60 s old (fresh upload, not a duplicate)
+      // created: false → file is older than 60 s (likely a pre-existing duplicate)
+      const created = createdDate
+        ? Date.now() - new Date(createdDate).getTime() <= 60_000
+        : null;
+      return { ...uploadResult, ...fileInfo, fileId, created, createdDate: createdDate ?? null };
+    } catch {
+      // Lexware may still be processing the file — don't fail the whole upload.
+      return { ...uploadResult, fileId, created: null, voucherStatus: 'processing' };
+    }
   }));
 
   server.registerTool('lexware_download_file', {
