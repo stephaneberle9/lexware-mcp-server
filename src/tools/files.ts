@@ -1,18 +1,55 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { lexwareRequest, lexwareUpload, lexwareDownload } from '../services/lexware.js';
 import { handleToolRequest } from '../helpers.js';
 import { UuidSchema } from '../schemas/common.js';
 
+const EXT_CONTENT_TYPES: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.tiff': 'image/tiff',
+  '.tif': 'image/tiff',
+};
+
 export function registerFileTools(server: McpServer): void {
   server.registerTool('lexware_upload_file', {
     title: 'Upload File',
-    description: 'Upload a file to Lexware.',
-    inputSchema: z.object({
-      fileName: z.string().describe('Name of the file to upload'),
-      contentBase64: z.string().describe('Base64-encoded file content'),
-      contentType: z.string().optional().describe('MIME type, defaults to application/pdf'),
-    }),
+    description:
+      'Upload a file to Lexware. Provide either filePath (absolute path on the MCP server host) or ' +
+      'contentBase64 (base64-encoded content) — not both. When using filePath, fileName is optional ' +
+      '(derived from the file name) and contentType is auto-detected for common image extensions. ' +
+      'When using contentBase64, fileName is required.',
+    inputSchema: z
+      .object({
+        filePath: z
+          .string()
+          .optional()
+          .describe('Absolute path to the file on the MCP server host. Must be readable by the MCP server process.'),
+        contentBase64: z
+          .string()
+          .optional()
+          .describe('Base64-encoded file content. Required when filePath is not provided.'),
+        fileName: z
+          .string()
+          .optional()
+          .describe('File name for the upload. Required when using contentBase64; derived from filePath when omitted.'),
+        contentType: z
+          .string()
+          .optional()
+          .describe(
+            'MIME type (e.g. application/pdf, image/png). Defaults to application/pdf. ' +
+            'Auto-detected from filePath extension for .png, .jpg/.jpeg, .tiff/.tif.'
+          ),
+      })
+      .refine((data) => !!(data.filePath) !== !!(data.contentBase64), {
+        message: 'Exactly one of filePath or contentBase64 must be provided',
+      })
+      .refine((data) => !(data.contentBase64 && !data.fileName), {
+        message: 'fileName is required when using contentBase64',
+      }),
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -20,8 +57,36 @@ export function registerFileTools(server: McpServer): void {
       openWorldHint: true,
     },
   }, handleToolRequest(async (params) => {
-    const buffer = Buffer.from(params.contentBase64, 'base64');
-    return lexwareUpload('/files', buffer, params.fileName, params.contentType || 'application/pdf');
+    let buffer: Buffer;
+    let resolvedFileName: string;
+    let resolvedContentType: string;
+
+    if (params.filePath) {
+      if (!path.isAbsolute(params.filePath)) {
+        throw new Error(`filePath must be absolute, got: ${params.filePath}`);
+      }
+      let resolved: string;
+      try {
+        resolved = fs.realpathSync(params.filePath);
+      } catch (err) {
+        throw new Error(`Cannot resolve filePath "${params.filePath}": ${(err as NodeJS.ErrnoException).message}`);
+      }
+      try {
+        fs.accessSync(resolved, fs.constants.R_OK);
+      } catch (err) {
+        throw new Error(`File not readable at "${resolved}": ${(err as NodeJS.ErrnoException).message}`);
+      }
+      buffer = fs.readFileSync(resolved);
+      resolvedFileName = params.fileName ?? path.basename(resolved);
+      const ext = path.extname(resolved).toLowerCase();
+      resolvedContentType = params.contentType ?? EXT_CONTENT_TYPES[ext] ?? 'application/pdf';
+    } else {
+      buffer = Buffer.from(params.contentBase64!, 'base64');
+      resolvedFileName = params.fileName!;
+      resolvedContentType = params.contentType ?? 'application/pdf';
+    }
+
+    return lexwareUpload('/files', buffer, resolvedFileName, resolvedContentType);
   }));
 
   server.registerTool('lexware_download_file', {
