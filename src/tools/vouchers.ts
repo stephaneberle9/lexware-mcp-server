@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { lexwareRequest, lexwareUpload } from '../services/lexware.js';
 import { handleToolRequest, withProcessingRetry } from '../helpers.js';
-import { UuidSchema, PaginationParams } from '../schemas/common.js';
+import { UuidSchema } from '../schemas/common.js';
 import { normalizeVoucherStatus } from '../helpers/normalize-voucher-status.js';
 
 const EXT_CONTENT_TYPES: Record<string, string> = {
@@ -14,6 +14,30 @@ const EXT_CONTENT_TYPES: Record<string, string> = {
   '.tiff': 'image/tiff',
   '.tif': 'image/tiff',
 };
+
+// O(m*n) DP wildcard match — no RegExp construction, immune to ReDoS.
+// % matches any sequence of chars, _ matches exactly one char. Case-insensitive.
+function wildcardMatch(pattern: string, text: string): boolean {
+  const p = pattern.toLowerCase();
+  const t = text.toLowerCase();
+  const m = p.length;
+  const n = t.length;
+  const dp: boolean[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(false));
+  dp[0][0] = true;
+  for (let i = 1; i <= m; i++) {
+    if (p[i - 1] === '%') dp[i][0] = dp[i - 1][0];
+  }
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (p[i - 1] === '%') {
+        dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+      } else if (p[i - 1] === '_' || p[i - 1] === t[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      }
+    }
+  }
+  return dp[m][n];
+}
 
 export function registerVoucherTools(server: McpServer): void {
   server.registerTool('lexware_create_voucher', {
@@ -95,15 +119,31 @@ export function registerVoucherTools(server: McpServer): void {
     title: 'List Vouchers',
     description:
       'List bookkeeping vouchers from Lexware with optional filters. ' +
+      'Automatically fetches all pages and applies client-side filters for contactName, ' +
+      'voucherDateFrom, voucherDateTo, and hasOpenAmount. ' +
       'voucherStatus filter values (case-insensitive): unchecked (pending review), ' +
       'open (due for payment), paid, paidoff (settled), voided (cancelled), ' +
       'transferred (posted), sepadebit (SEPA direct debit). ' +
-      'The value is normalised to lowercase before the API call.',
+      'Returns { content, totalCount, fetchedPages }.',
     inputSchema: z.object({
-      ...PaginationParams,
-      voucherNumber: z.string().optional().describe('Filter by voucher number'),
+      size: z.number().int().min(1).max(250).optional().describe(
+        'Results per API request (default 250). Controls fetch batch size, not result count.'
+      ),
+      voucherNumber: z.string().optional().describe('Filter by voucher number (API-side)'),
       voucherStatus: z.string().optional().describe(
-        'Filter by voucher status. Accepted values: unchecked, open, paid, paidoff, voided, transferred, sepadebit. Case-insensitive.'
+        'Filter by voucher status (API-side). Accepted values: unchecked, open, paid, paidoff, voided, transferred, sepadebit. Case-insensitive.'
+      ),
+      contactName: z.string().optional().describe(
+        'Wildcard filter on contactName (client-side). % = any chars, _ = any single char. Case-insensitive. Example: "Müller%".'
+      ),
+      voucherDateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}/, 'Must be YYYY-MM-DD').optional().describe(
+        'Include only vouchers with voucherDate >= this date (inclusive). Format: YYYY-MM-DD.'
+      ),
+      voucherDateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}/, 'Must be YYYY-MM-DD').optional().describe(
+        'Include only vouchers with voucherDate <= this date (inclusive). Format: YYYY-MM-DD.'
+      ),
+      hasOpenAmount: z.boolean().optional().describe(
+        'When true, include only vouchers with openAmount > 0.'
       ),
     }),
     annotations: {
@@ -113,12 +153,49 @@ export function registerVoucherTools(server: McpServer): void {
       openWorldHint: true,
     },
   }, handleToolRequest(async (params) => {
-    return lexwareRequest('GET', '/vouchers', undefined, {
-      page: params.page,
-      size: params.size,
-      voucherNumber: params.voucherNumber,
-      voucherStatus: params.voucherStatus ? normalizeVoucherStatus(params.voucherStatus) : undefined,
-    });
+    const pageSize = params.size ?? 250;
+    let page = 0;
+    let totalPages = 1;
+    const allVouchers: Record<string, unknown>[] = [];
+
+    while (page < totalPages) {
+      const response = await lexwareRequest<{ content: Record<string, unknown>[]; totalPages: number }>(
+        'GET', '/vouchers', undefined,
+        {
+          voucherNumber: params.voucherNumber,
+          voucherStatus: params.voucherStatus ? normalizeVoucherStatus(params.voucherStatus) : undefined,
+          page,
+          size: pageSize,
+        },
+      );
+      allVouchers.push(...(response.content ?? []));
+      totalPages = response.totalPages ?? 1;
+      page++;
+    }
+
+    const fetchedPages = page;
+    let filtered = allVouchers;
+
+    if (params.contactName) {
+      const pattern = params.contactName;
+      filtered = filtered.filter((v) => typeof v.contactName === 'string' && wildcardMatch(pattern, v.contactName));
+    }
+
+    if (params.voucherDateFrom) {
+      const from = params.voucherDateFrom;
+      filtered = filtered.filter((v) => typeof v.voucherDate === 'string' && v.voucherDate >= from);
+    }
+
+    if (params.voucherDateTo) {
+      const to = params.voucherDateTo;
+      filtered = filtered.filter((v) => typeof v.voucherDate === 'string' && v.voucherDate <= to);
+    }
+
+    if (params.hasOpenAmount === true) {
+      filtered = filtered.filter((v) => typeof v.openAmount === 'number' && v.openAmount > 0);
+    }
+
+    return { content: filtered, totalCount: filtered.length, fetchedPages };
   }));
 
   server.registerTool('lexware_upload_voucher_file', {
