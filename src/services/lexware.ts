@@ -122,7 +122,11 @@ function formatError(err: AxiosError): Error {
     return new Error(`Lexware API [${standard.status}]: ${standard.message}`, { cause: err });
   }
 
-  return new Error(`Lexware API error: ${err.response.status} ${err.response.statusText}`, { cause: err });
+  const bodyStr = body
+    ? (typeof body === 'string' ? body : JSON.stringify(body))
+    : '';
+  const suffix = bodyStr ? ` — ${bodyStr}` : '';
+  return new Error(`Lexware API error: ${err.response.status} ${err.response.statusText}${suffix}`, { cause: err });
 }
 
 export async function lexwareRequest<T = unknown>(
@@ -155,24 +159,38 @@ export async function lexwareUpload<T = unknown>(
   path: string,
   fileBuffer: Buffer,
   fileName: string,
-  contentType: string
+  contentType: string,
+  formFields?: Record<string, string>,
 ): Promise<T> {
-  const [client, token] = await Promise.all([getClient(), getToken()]);
-  // GOTCHA: Dynamic import — won't fail at compile time if form-data is missing, only at runtime.
-  const FormData = (await import('form-data')).default;
-  const form = new FormData();
-  form.append('file', fileBuffer, { filename: fileName, contentType });
+  try {
+    const [client, token] = await Promise.all([getClient(), getToken()]);
+    // GOTCHA: Dynamic import — won't fail at compile time if form-data is missing, only at runtime.
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    form.append('file', fileBuffer, { filename: fileName, contentType });
+    for (const [key, value] of Object.entries(formFields ?? {})) {
+      form.append(key, value);
+    }
 
-  const response = await client.request<T>({
-    method: 'POST',
-    url: path,
-    data: form,
-    headers: {
-      ...form.getHeaders(),
-      Authorization: `Bearer ${token}`,
-    },
-  });
-  return response.data;
+    const response = await client.request<T>({
+      method: 'POST',
+      url: path,
+      data: form,
+      headers: {
+        ...form.getHeaders(),
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    return response.data;
+  } catch (err) {
+    if (err instanceof AxiosError && err.response) {
+      throw formatError(err);
+    }
+    if (err instanceof AxiosError && err.code) {
+      throw new Error(`Network error: ${err.message}`, { cause: err });
+    }
+    throw err;
+  }
 }
 
 const WEBHOOK_PUBLIC_KEY_URL =

@@ -101,7 +101,15 @@ export function registerFileTools(server: McpServer): void {
       }));
     }
 
-    const uploadResult = await lexwareUpload<Record<string, unknown>>('/files', buffer, resolvedFileName, resolvedContentType);
+    // Lexware Public API: POST /files requires a multipart `type` field.
+    // The only currently supported value is "voucher".
+    const uploadResult = await lexwareUpload<Record<string, unknown>>(
+      '/files',
+      buffer,
+      resolvedFileName,
+      resolvedContentType,
+      { type: 'voucher' },
+    );
 
     // Extract the file ID — the API may use 'id' (UUID) or 'documentFileId'.
     const fileId = (uploadResult.id ?? uploadResult.documentFileId) as string | undefined;
