@@ -6,7 +6,7 @@ MCP server for the [Lexware Office API](https://developers.lexware.io/docs/). Ma
 
 > **Unofficial — community project.** Not affiliated with, endorsed by, or supported by Lexware GmbH or Haufe Group. "Lexware" and "Lexware Office" are trademarks of their respective owners; used here only to identify the API this client targets (nominative fair use).
 
-**65 tools** across 20 resource domains, with 6 entry points so you can pick the right server for your MCP client's tool limit.
+**66 tools** across 20 resource domains, with 6 entry points so you can pick the right server for your MCP client's tool limit.
 
 ## Installation
 
@@ -132,12 +132,12 @@ export LEXWARE_WEBHOOK_PUBLIC_KEY="$(cat lexware-webhook-public.pem)"
 
 | Command | Domains | Tools |
 |---|---|---|
-| `lexware-mcp-server` | All 20 domains | 65 |
+| `lexware-mcp-server` | All 20 domains | 66 |
 | `lexware-mcp-sales` | Invoices, Credit Notes, Quotations, Order Confirmations, Delivery Notes, Down Payment Invoices, Dunnings, Voucherlist | 32 |
 | `lexware-mcp-contacts` | Contacts, Articles | 10 |
 | `lexware-mcp-bookkeeping` | Vouchers, Voucherlist, Payments | 8 |
 | `lexware-mcp-reference` | Countries, Payment Conditions, Posting Categories, Profile, Print Layouts | 5 |
-| `lexware-mcp-system` | Event Subscriptions, Files, Recurring Templates | 11 |
+| `lexware-mcp-system` | Event Subscriptions, Files, Recurring Templates | 12 |
 
 Use split servers to reduce context size — pick only the splits you need.
 
@@ -322,20 +322,28 @@ returns `{ voucherId, status: "processing", message }`. Other failures are repor
 
 `lexware_create_event_subscription`, `lexware_list_event_subscriptions`, `lexware_get_event_subscription`, `lexware_delete_event_subscription`, `lexware_verify_webhook_signature`
 
-### Files (3 tools) — system
+### Files (4 tools) — system
 
-`lexware_upload_file`, `lexware_download_file`, `lexware_deeplink_file`
+`lexware_upload_file`, `lexware_download_file`, `lexware_get_file_status`, `lexware_deeplink_file`
+
+`lexware_get_file_status` calls `GET /files/{id}/status`. The bare `GET /files/{id}` is the binary
+download route — with `Accept: application/json` it still answers `200` with the file body
+base64-encoded, so it can never yield status metadata. The status route is scope-gated: API keys
+without the necessary permission get `access_denied` from Lexware rather than a status.
 
 Both upload tools (`lexware_upload_file` and `lexware_upload_voucher_file`) take the file either as
 `contentBase64` or as `filePath` — an absolute path readable by the MCP server process. Prefer
 `filePath` for anything sizeable: base64 inflates the payload by about a third and has to travel
 through the model's context window. With `filePath`, `fileName` defaults to the file's base name and
-`contentType` is auto-detected for `.png`, `.jpg`/`.jpeg` and `.tiff`/`.tif`, falling back to
-`application/pdf`. Provide exactly one of the two — supplying both, or neither, is a validation error.
+`contentType` is auto-detected for `.png`, `.jpg`/`.jpeg`, `.tiff`/`.tif` and `.xml`, falling back
+to `application/pdf`. Provide exactly one of the two — supplying both, or neither, is a validation
+error.
 
-Uploads are capped at 5 MB. The limit is checked against the decoded bytes before anything is sent,
-so an oversized file fails immediately with a `file_too_large` error carrying the actual and maximum
-sizes rather than after streaming the whole body to Lexware.
+Uploads are capped at 5 MB. For `filePath` the size is taken from the opened descriptor *before* the
+file is read, so an oversized file costs a stat rather than a full load into memory, and anything
+that is not a regular file is refused outright (reading `/dev/zero` would otherwise never return).
+The decoded byte count is checked again afterwards, which also covers `contentBase64`. Failures
+carry a `file_too_large` error with the actual and maximum sizes.
 
 ### Recurring Templates (3 tools) — system
 
